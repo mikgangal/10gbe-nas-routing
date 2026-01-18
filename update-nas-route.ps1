@@ -7,7 +7,27 @@ param(
 )
 
 $HostsFile = "C:\Windows\System32\drivers\etc\hosts"
-$StateFile = "$env:ProgramData\NASRouteSwitcher\last-route.txt"
+$DataDir = "C:\ProgramData\NASRouteSwitcher"
+$StateFile = "$DataDir\last-route.txt"
+$LogFile = "$DataDir\route-switcher.log"
+
+# Ensure data directory exists
+if (-not (Test-Path $DataDir)) {
+    New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+}
+
+# Immediate log to confirm script started
+Add-Content -Path $LogFile -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Script starting..." -ErrorAction SilentlyContinue
+
+# Wait for network state to stabilize after event trigger
+Start-Sleep -Seconds 3
+Add-Content -Path $LogFile -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Waited 3 seconds for network state to stabilize" -ErrorAction SilentlyContinue
+
+function Write-Log($msg) {
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logLine = "[$timestamp] $msg"
+    Add-Content -Path $LogFile -Value $logLine -ErrorAction SilentlyContinue
+}
 $NasHostnames = @("gangal-nas", "gangal-nas.local")
 $Nas10GbeIP = "10.10.10.100"
 $Nas1GbeIP = "192.168.1.43"
@@ -76,37 +96,19 @@ function Reset-SmbConnections {
 }
 
 function Show-ToastNotification($title, $message) {
-    $toastDir = "$env:ProgramData\NASRouteSwitcher"
-    if (-not (Test-Path $toastDir)) {
-        New-Item -ItemType Directory -Path $toastDir -Force | Out-Null
-    }
+    $toastDir = "$DataDir"
 
-    # Create helper script using single-quoted here-string to avoid escaping issues
-    $helperScript = "$toastDir\show-toast.ps1"
-    $helperContent = @'
-param([string]$Title, [string]$Message)
-Add-Type -AssemblyName System.Windows.Forms
-$balloon = New-Object System.Windows.Forms.NotifyIcon
-$balloon.Icon = [System.Drawing.SystemIcons]::Information
-$balloon.BalloonTipIcon = 'Info'
-$balloon.BalloonTipTitle = $Title
-$balloon.BalloonTipText = $Message
-$balloon.Visible = $true
-$balloon.ShowBalloonTip(5000)
-Start-Sleep -Seconds 6
-$balloon.Dispose()
-'@
-    $helperContent | Set-Content $helperScript -Force
+    # Create VBScript for silent notification (no console window)
+    $vbsScript = "$toastDir\show-toast.vbs"
+    @"
+Set objShell = CreateObject("WScript.Shell")
+objShell.Popup "$message", 5, "$title", 64
+"@ | Set-Content $vbsScript -Force
 
-    # Run as current interactive user
+    # Run VBScript as interactive user via scheduled task
     try {
-        # Find the console session
-        $sessionId = (Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1).SessionId
-        if ($null -eq $sessionId) { $sessionId = 1 }
-
-        # Create scheduled task to run in user context
         $taskName = "NASToast_$((Get-Random).ToString())"
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$helperScript`" -Title `"$title`" -Message `"$message`""
+        $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$vbsScript`""
         $principal = New-ScheduledTaskPrincipal -GroupId "BUILTIN\Users" -RunLevel Limited
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
 
@@ -156,17 +158,23 @@ function Update-HostsFile($ip) {
     $newContent | Set-Content $HostsFile -Force
 }
 
+Write-Log "========== Script started =========="
 Write-Status "=== NAS Route Switcher ===" "Cyan"
 Write-Status ""
 
 # Check adapter status
+Write-Log "Checking network adapters..."
 $adapter10GbE = Find-10GbEAdapter
 $has10GbE = $null -ne $adapter10GbE
 $hasLAN = Get-AdapterStatus $AdapterLAN
 $hasWiFi = Get-AdapterStatus $AdapterWiFi
 
-Write-Status "Network Status:" "Yellow"
 $10GbEName = if ($has10GbE) { $adapter10GbE.Name } else { "not connected" }
+Write-Log "10GbE ($10GbEName): $(if($has10GbE){'UP'}else{'DOWN'})"
+Write-Log "LAN ($AdapterLAN): $(if($hasLAN){'UP'}else{'DOWN'})"
+Write-Log "WiFi ($AdapterWiFi): $(if($hasWiFi){'UP'}else{'DOWN'})"
+
+Write-Status "Network Status:" "Yellow"
 Write-Status "  10GbE ($10GbEName): $(if($has10GbE){'UP'}else{'DOWN'})" $(if($has10GbE){"Green"}else{"Gray"})
 Write-Status "  LAN ($AdapterLAN): $(if($hasLAN){'UP'}else{'DOWN'})" $(if($hasLAN){"Green"}else{"Gray"})
 Write-Status "  WiFi ($AdapterWiFi): $(if($hasWiFi){'UP'}else{'DOWN'})" $(if($hasWiFi){"Green"}else{"Gray"})
@@ -180,10 +188,12 @@ if ($has10GbE) {
     $selectedIP = $Nas1GbeIP
     $selectedRoute = if ($hasLAN) { "LAN (1GbE)" } else { "WiFi" }
 } else {
+    Write-Log "ERROR: No network adapters connected"
     Write-Status "ERROR: No network adapters connected!" "Red"
     exit 1
 }
 
+Write-Log "Selected route: $selectedRoute ($selectedIP)"
 Write-Status "Selected Route: $selectedRoute" "Green"
 Write-Status "NAS IP: $selectedIP" "Green"
 Write-Status ""
@@ -191,31 +201,42 @@ Write-Status ""
 # Check admin privileges
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
+    Write-Log "ERROR: Not running as admin"
     Write-Status "ERROR: Run as Administrator to modify hosts file" "Red"
     exit 1
 }
+Write-Log "Running as admin: OK"
 
 # Check if route changed
 $lastRoute = Get-LastRoute
 $routeChanged = ($lastRoute -ne $selectedRoute)
+Write-Log "Last route: '$lastRoute' | New route: '$selectedRoute' | Changed: $routeChanged"
 
 # If route changed, reset SMB connections first (prevents hanging)
 if ($routeChanged -and $lastRoute) {
+    Write-Log "Route changed - resetting SMB connections..."
     Reset-SmbConnections
+    Write-Log "SMB reset complete"
 }
 
 # Update hosts file
 try {
+    Write-Log "Updating hosts file..."
     Update-HostsFile $selectedIP
     Write-Status "Hosts file updated successfully" "Green"
+    Write-Log "Hosts file updated"
 
     # Flush DNS cache
+    Write-Log "Flushing DNS cache..."
     ipconfig /flushdns | Out-Null
     Write-Status "DNS cache flushed" "Green"
+    Write-Log "DNS cache flushed"
 
     # Save current route
     Save-CurrentRoute $selectedRoute
+    Write-Log "Route state saved"
 } catch {
+    Write-Log "ERROR: Failed to update hosts file: $_"
     Write-Status "ERROR: Failed to update hosts file: $_" "Red"
     exit 1
 }
@@ -224,23 +245,29 @@ Write-Status ""
 
 # Verify connectivity
 Write-Status "Testing connectivity..." "Yellow"
+Write-Log "Testing connectivity to $selectedIP..."
 $ping = Test-Connection -ComputerName $selectedIP -Count 1 -ErrorAction SilentlyContinue
 if ($ping) {
     Write-Status "NAS is reachable at $selectedIP" "Green"
+    Write-Log "Ping to $selectedIP - SUCCESS"
 } else {
     Write-Status "WARNING: NAS not responding at $selectedIP" "Red"
+    Write-Log "Ping to $selectedIP - FAILED"
 }
 
 # Show toast notification if route changed
 if ($routeChanged) {
     Write-Status ""
     Write-Status "Route changed from '$lastRoute' to '$selectedRoute' - showing notification" "Yellow"
+    Write-Log "Showing toast notification..."
 
     $icon = if ($selectedRoute -eq "10GbE Direct") { "⚡" } else { "🌐" }
     $speed = if ($selectedRoute -eq "10GbE Direct") { "10 Gbps" } elseif ($selectedRoute -eq "LAN (1GbE)") { "1 Gbps" } else { "WiFi" }
 
     Show-ToastNotification "NAS Route: $selectedRoute" "Gangal-NAS now connected via $speed ($selectedIP)"
+    Write-Log "Toast notification triggered"
 }
 
+Write-Log "========== Script completed =========="
 Write-Status ""
 Write-Status "=== Done ===" "Cyan"

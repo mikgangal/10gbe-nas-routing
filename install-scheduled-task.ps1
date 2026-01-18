@@ -42,6 +42,10 @@ $taskXml = @"
       <Enabled>true</Enabled>
       <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="Microsoft-Windows-NetworkProfile/Operational"&gt;&lt;Select Path="Microsoft-Windows-NetworkProfile/Operational"&gt;*[System[EventID=10001]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
     </EventTrigger>
+    <EventTrigger>
+      <Enabled>true</Enabled>
+      <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="Microsoft-Windows-NetworkProfile/Operational"&gt;&lt;Select Path="Microsoft-Windows-NetworkProfile/Operational"&gt;*[System[EventID=4004]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
+    </EventTrigger>
     <LogonTrigger>
       <Enabled>true</Enabled>
     </LogonTrigger>
@@ -87,6 +91,7 @@ try {
     Write-Host "Triggers:" -ForegroundColor Yellow
     Write-Host "  - Network connected (Event ID 10000)"
     Write-Host "  - Network disconnected (Event ID 10001)"
+    Write-Host "  - Network state change (Event ID 4004)"
     Write-Host "  - User logon"
     Write-Host ""
     Write-Host "The task runs as SYSTEM with highest privileges." -ForegroundColor Gray
