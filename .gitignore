@@ -1,0 +1,7 @@
+# Log files
+*.log
+*.txt
+!README.txt
+
+# Claude Code settings
+.claude/
