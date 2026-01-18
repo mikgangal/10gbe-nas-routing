@@ -48,17 +48,43 @@ function Save-CurrentRoute($route) {
     $route | Set-Content $StateFile -Force
 }
 
+function Reset-SmbConnections {
+    Write-Status "Resetting SMB connections to NAS..." "Yellow"
+
+    # Close all SMB connections to the NAS
+    foreach ($hostname in $NasHostnames) {
+        net use "\\$hostname" /delete /y 2>$null | Out-Null
+    }
+
+    # Also close connections by IP
+    net use "\\$Nas10GbeIP" /delete /y 2>$null | Out-Null
+    net use "\\$Nas1GbeIP" /delete /y 2>$null | Out-Null
+
+    # Remove any SMB mappings (like Z: drive)
+    Get-SmbMapping -ErrorAction SilentlyContinue | Where-Object {
+        $_.RemotePath -match "gangal-nas|$Nas10GbeIP|$Nas1GbeIP"
+    } | ForEach-Object {
+        Remove-SmbMapping -RemotePath $_.RemotePath -Force -ErrorAction SilentlyContinue
+    }
+
+    # Close SMB sessions
+    Get-SmbSession -ErrorAction SilentlyContinue | Where-Object {
+        $_.ClientComputerName -match "gangal-nas|$Nas10GbeIP|$Nas1GbeIP"
+    } | Close-SmbSession -Force -ErrorAction SilentlyContinue
+
+    Write-Status "SMB connections reset" "Green"
+}
+
 function Show-ToastNotification($title, $message) {
-    # Write toast request to file for helper script
     $toastDir = "$env:ProgramData\NASRouteSwitcher"
     if (-not (Test-Path $toastDir)) {
         New-Item -ItemType Directory -Path $toastDir -Force | Out-Null
     }
 
-    # Create a small helper script in user-accessible location
+    # Create helper script using single-quoted here-string to avoid escaping issues
     $helperScript = "$toastDir\show-toast.ps1"
     $helperContent = @'
-param($Title, $Message)
+param([string]$Title, [string]$Message)
 Add-Type -AssemblyName System.Windows.Forms
 $balloon = New-Object System.Windows.Forms.NotifyIcon
 $balloon.Icon = [System.Drawing.SystemIcons]::Information
@@ -72,35 +98,24 @@ $balloon.Dispose()
 '@
     $helperContent | Set-Content $helperScript -Force
 
-    # Find logged-in user and run toast in their context
-    $sessions = query user 2>$null | Select-Object -Skip 1
-    if ($sessions) {
-        $activeSession = $sessions | Where-Object { $_ -match 'Active' } | Select-Object -First 1
-        if ($activeSession -and $activeSession -match '^\s*>?(\S+)') {
-            $userName = $Matches[1]
+    # Run as current interactive user
+    try {
+        # Find the console session
+        $sessionId = (Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1).SessionId
+        if ($null -eq $sessionId) { $sessionId = 1 }
 
-            # Create one-time task to show toast as the user
-            $escapedTitle = $title -replace '"', '\"'
-            $escapedMessage = $message -replace '"', '\"'
-            $taskXml = @"
-<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Triggers><TimeTrigger><StartBoundary>1900-01-01T00:00:00</StartBoundary><Enabled>false</Enabled></TimeTrigger></Triggers>
-  <Principals><Principal><GroupId>S-1-5-32-545</GroupId><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
-  <Settings><MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT1M</ExecutionTimeLimit><DeleteExpiredTaskAfter>PT0S</DeleteExpiredTaskAfter></Settings>
-  <Actions><Exec><Command>powershell.exe</Command><Arguments>-WindowStyle Hidden -ExecutionPolicy Bypass -File "$helperScript" -Title "$escapedTitle" -Message "$escapedMessage"</Arguments></Exec></Actions>
-</Task>
-"@
-            $taskName = "NASToast_$([guid]::NewGuid().ToString('N').Substring(0,8))"
-            try {
-                Register-ScheduledTask -TaskName $taskName -Xml $taskXml -Force | Out-Null
-                Start-ScheduledTask -TaskName $taskName
-                Start-Sleep -Seconds 1
-                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-            } catch {
-                Write-Status "Toast notification failed: $_" "Yellow"
-            }
-        }
+        # Create scheduled task to run in user context
+        $taskName = "NASToast_$((Get-Random).ToString())"
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$helperScript`" -Title `"$title`" -Message `"$message`""
+        $principal = New-ScheduledTaskPrincipal -GroupId "BUILTIN\Users" -RunLevel Limited
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
+
+        Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+        Start-Sleep -Seconds 1
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    } catch {
+        Write-Status "Toast notification failed: $_" "Yellow"
     }
 }
 
@@ -183,6 +198,11 @@ if (-not $isAdmin) {
 # Check if route changed
 $lastRoute = Get-LastRoute
 $routeChanged = ($lastRoute -ne $selectedRoute)
+
+# If route changed, reset SMB connections first (prevents hanging)
+if ($routeChanged -and $lastRoute) {
+    Reset-SmbConnections
+}
 
 # Update hosts file
 try {
