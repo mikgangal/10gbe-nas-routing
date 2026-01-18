@@ -31,6 +31,7 @@ Or from PowerShell (Admin):
 3. Updates the hosts file to point `gangal-nas` to the correct IP
 4. Flushes DNS cache
 5. Verifies NAS connectivity
+6. Shows a balloon notification when the route changes
 
 ### NAS IP Addresses
 

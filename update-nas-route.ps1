@@ -7,6 +7,7 @@ param(
 )
 
 $HostsFile = "C:\Windows\System32\drivers\etc\hosts"
+$StateFile = "$env:ProgramData\NASRouteSwitcher\last-route.txt"
 $NasHostnames = @("gangal-nas", "gangal-nas.local")
 $Nas10GbeIP = "10.10.10.100"
 $Nas1GbeIP = "192.168.1.43"
@@ -30,6 +31,77 @@ function Find-10GbEAdapter {
         $_.InterfaceDescription -match "10G|OWC" -and $_.Status -eq "Up"
     }
     return $adapter
+}
+
+function Get-LastRoute {
+    if (Test-Path $StateFile) {
+        return Get-Content $StateFile -ErrorAction SilentlyContinue
+    }
+    return $null
+}
+
+function Save-CurrentRoute($route) {
+    $stateDir = Split-Path $StateFile -Parent
+    if (-not (Test-Path $stateDir)) {
+        New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+    }
+    $route | Set-Content $StateFile -Force
+}
+
+function Show-ToastNotification($title, $message) {
+    # Write toast request to file for helper script
+    $toastDir = "$env:ProgramData\NASRouteSwitcher"
+    if (-not (Test-Path $toastDir)) {
+        New-Item -ItemType Directory -Path $toastDir -Force | Out-Null
+    }
+
+    # Create a small helper script in user-accessible location
+    $helperScript = "$toastDir\show-toast.ps1"
+    $helperContent = @'
+param($Title, $Message)
+Add-Type -AssemblyName System.Windows.Forms
+$balloon = New-Object System.Windows.Forms.NotifyIcon
+$balloon.Icon = [System.Drawing.SystemIcons]::Information
+$balloon.BalloonTipIcon = 'Info'
+$balloon.BalloonTipTitle = $Title
+$balloon.BalloonTipText = $Message
+$balloon.Visible = $true
+$balloon.ShowBalloonTip(5000)
+Start-Sleep -Seconds 6
+$balloon.Dispose()
+'@
+    $helperContent | Set-Content $helperScript -Force
+
+    # Find logged-in user and run toast in their context
+    $sessions = query user 2>$null | Select-Object -Skip 1
+    if ($sessions) {
+        $activeSession = $sessions | Where-Object { $_ -match 'Active' } | Select-Object -First 1
+        if ($activeSession -and $activeSession -match '^\s*>?(\S+)') {
+            $userName = $Matches[1]
+
+            # Create one-time task to show toast as the user
+            $escapedTitle = $title -replace '"', '\"'
+            $escapedMessage = $message -replace '"', '\"'
+            $taskXml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers><TimeTrigger><StartBoundary>1900-01-01T00:00:00</StartBoundary><Enabled>false</Enabled></TimeTrigger></Triggers>
+  <Principals><Principal><GroupId>S-1-5-32-545</GroupId><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings><MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT1M</ExecutionTimeLimit><DeleteExpiredTaskAfter>PT0S</DeleteExpiredTaskAfter></Settings>
+  <Actions><Exec><Command>powershell.exe</Command><Arguments>-WindowStyle Hidden -ExecutionPolicy Bypass -File "$helperScript" -Title "$escapedTitle" -Message "$escapedMessage"</Arguments></Exec></Actions>
+</Task>
+"@
+            $taskName = "NASToast_$([guid]::NewGuid().ToString('N').Substring(0,8))"
+            try {
+                Register-ScheduledTask -TaskName $taskName -Xml $taskXml -Force | Out-Null
+                Start-ScheduledTask -TaskName $taskName
+                Start-Sleep -Seconds 1
+                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            } catch {
+                Write-Status "Toast notification failed: $_" "Yellow"
+            }
+        }
+    }
 }
 
 function Update-HostsFile($ip) {
@@ -108,6 +180,10 @@ if (-not $isAdmin) {
     exit 1
 }
 
+# Check if route changed
+$lastRoute = Get-LastRoute
+$routeChanged = ($lastRoute -ne $selectedRoute)
+
 # Update hosts file
 try {
     Update-HostsFile $selectedIP
@@ -116,6 +192,9 @@ try {
     # Flush DNS cache
     ipconfig /flushdns | Out-Null
     Write-Status "DNS cache flushed" "Green"
+
+    # Save current route
+    Save-CurrentRoute $selectedRoute
 } catch {
     Write-Status "ERROR: Failed to update hosts file: $_" "Red"
     exit 1
@@ -130,6 +209,17 @@ if ($ping) {
     Write-Status "NAS is reachable at $selectedIP" "Green"
 } else {
     Write-Status "WARNING: NAS not responding at $selectedIP" "Red"
+}
+
+# Show toast notification if route changed
+if ($routeChanged) {
+    Write-Status ""
+    Write-Status "Route changed from '$lastRoute' to '$selectedRoute' - showing notification" "Yellow"
+
+    $icon = if ($selectedRoute -eq "10GbE Direct") { "⚡" } else { "🌐" }
+    $speed = if ($selectedRoute -eq "10GbE Direct") { "10 Gbps" } elseif ($selectedRoute -eq "LAN (1GbE)") { "1 Gbps" } else { "WiFi" }
+
+    Show-ToastNotification "NAS Route: $selectedRoute" "Gangal-NAS now connected via $speed ($selectedIP)"
 }
 
 Write-Status ""
