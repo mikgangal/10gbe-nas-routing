@@ -10,6 +10,7 @@ $HostsFile = "C:\Windows\System32\drivers\etc\hosts"
 $DataDir = "C:\ProgramData\NASRouteSwitcher"
 $StateFile = "$DataDir\last-route.txt"
 $LogFile = "$DataDir\route-switcher.log"
+$AdapterDownMarker = "$DataDir\adapter-down.marker"
 
 # Ensure data directory exists
 if (-not (Test-Path $DataDir)) {
@@ -20,8 +21,9 @@ if (-not (Test-Path $DataDir)) {
 Add-Content -Path $LogFile -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Script starting..." -ErrorAction SilentlyContinue
 
 # Wait for network state to stabilize after event trigger
-Start-Sleep -Seconds 3
-Add-Content -Path $LogFile -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Waited 3 seconds for network state to stabilize" -ErrorAction SilentlyContinue
+# Thunderbolt daisy-chain re-enumeration can take 15-30s, so we wait longer
+Start-Sleep -Seconds 15
+Add-Content -Path $LogFile -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Waited 15 seconds for network state to stabilize" -ErrorAction SilentlyContinue
 
 function Write-Log($msg) {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -144,8 +146,12 @@ function Update-HostsFile($ip) {
     }
 
     # Remove trailing empty lines
-    while ($newContent.Count -gt 0 -and $newContent[-1] -match "^\s*$") {
+    while ($newContent.Count -gt 1 -and $newContent[-1] -match "^\s*$") {
         $newContent = $newContent[0..($newContent.Count - 2)]
+    }
+    # Handle edge case: single empty element
+    if ($newContent.Count -eq 1 -and $newContent[0] -match "^\s*$") {
+        $newContent = @()
     }
 
     # Add new NAS entries
@@ -162,12 +168,37 @@ Write-Log "========== Script started =========="
 Write-Status "=== NAS Route Switcher ===" "Cyan"
 Write-Status ""
 
-# Check adapter status
+# Check adapter status with retry for 10GbE
+# Thunderbolt daisy-chain devices can take time to enumerate after connect events,
+# so if 10GbE was previously active and now appears down, retry before switching away
 Write-Log "Checking network adapters..."
 $adapter10GbE = Find-10GbEAdapter
 $has10GbE = $null -ne $adapter10GbE
 $hasLAN = Get-AdapterStatus $AdapterLAN
 $hasWiFi = Get-AdapterStatus $AdapterWiFi
+
+# Debounce: if 10GbE is down but was our last route, retry up to 3 times
+# This prevents premature fallback during Thunderbolt re-enumeration
+$lastRoute = Get-LastRoute
+$10GbERecovered = $false
+if (-not $has10GbE -and $lastRoute -eq "10GbE Direct") {
+    $retryCount = 3
+    $retryDelay = 10
+    Write-Log "10GbE down but was last active route - retrying ($retryCount attempts, ${retryDelay}s apart)..."
+    Write-Status "10GbE not detected, retrying (was previously connected)..." "Yellow"
+    for ($i = 1; $i -le $retryCount; $i++) {
+        Start-Sleep -Seconds $retryDelay
+        $adapter10GbE = Find-10GbEAdapter
+        $has10GbE = $null -ne $adapter10GbE
+        Write-Log "  Retry ${i}/${retryCount}: 10GbE $(if($has10GbE){'FOUND'}else{'still down'})"
+        if ($has10GbE) {
+            # 10GbE was down and came back — SMB sessions are likely stale
+            $10GbERecovered = $true
+            Write-Log "10GbE recovered after being down - will force SMB reset"
+            break
+        }
+    }
+}
 
 $10GbEName = if ($has10GbE) { $adapter10GbE.Name } else { "not connected" }
 Write-Log "10GbE ($10GbEName): $(if($has10GbE){'UP'}else{'DOWN'})"
@@ -188,9 +219,42 @@ if ($has10GbE) {
     $selectedIP = $Nas1GbeIP
     $selectedRoute = if ($hasLAN) { "LAN (1GbE)" } else { "WiFi" }
 } else {
-    Write-Log "ERROR: No network adapters connected"
-    Write-Status "ERROR: No network adapters connected!" "Red"
-    exit 1
+    # All adapters down - likely Thunderbolt dock disconnect
+    # Write marker so reconnection knows to reset SMB sessions
+    Get-Date -Format "yyyy-MM-dd HH:mm:ss" | Set-Content $AdapterDownMarker -Force
+    Write-Log "All adapters down - wrote adapter-down marker, polling for recovery..."
+    Write-Status "All adapters down, waiting for reconnection..." "Yellow"
+
+    # Poll for any adapter to come back (up to 60s)
+    $pollInterval = 5
+    $maxPollTime = 60
+    $elapsed = 0
+    while ($elapsed -lt $maxPollTime) {
+        Start-Sleep -Seconds $pollInterval
+        $elapsed += $pollInterval
+        $adapter10GbE = Find-10GbEAdapter
+        $has10GbE = $null -ne $adapter10GbE
+        $hasLAN = Get-AdapterStatus $AdapterLAN
+        $hasWiFi = Get-AdapterStatus $AdapterWiFi
+        if ($has10GbE -or $hasLAN -or $hasWiFi) {
+            Write-Log "Adapter recovered after ${elapsed}s - 10GbE:$(if($has10GbE){'UP'}else{'DOWN'}) LAN:$(if($hasLAN){'UP'}else{'DOWN'}) WiFi:$(if($hasWiFi){'UP'}else{'DOWN'})"
+            break
+        }
+        Write-Log "  Poll ${elapsed}s/${maxPollTime}s: still no adapters"
+    }
+
+    # Re-evaluate after polling
+    if ($has10GbE) {
+        $selectedIP = $Nas10GbeIP
+        $selectedRoute = "10GbE Direct"
+    } elseif ($hasLAN -or $hasWiFi) {
+        $selectedIP = $Nas1GbeIP
+        $selectedRoute = if ($hasLAN) { "LAN (1GbE)" } else { "WiFi" }
+    } else {
+        Write-Log "ERROR: No adapters recovered after ${maxPollTime}s - giving up"
+        Write-Status "ERROR: No network adapters connected after waiting!" "Red"
+        exit 1
+    }
 }
 
 Write-Log "Selected route: $selectedRoute ($selectedIP)"
@@ -207,16 +271,27 @@ if (-not $isAdmin) {
 }
 Write-Log "Running as admin: OK"
 
-# Check if route changed
-$lastRoute = Get-LastRoute
+# Check if route changed (lastRoute already fetched above for debounce logic)
+if (-not $lastRoute) { $lastRoute = Get-LastRoute }
 $routeChanged = ($lastRoute -ne $selectedRoute)
-Write-Log "Last route: '$lastRoute' | New route: '$selectedRoute' | Changed: $routeChanged"
+$wasAdapterDown = Test-Path $AdapterDownMarker
+$needsSmbReset = $routeChanged -or $wasAdapterDown -or $10GbERecovered
+Write-Log "Last route: '$lastRoute' | New route: '$selectedRoute' | Changed: $routeChanged | Recovering from down: $wasAdapterDown | 10GbE recovered: $10GbERecovered"
 
-# If route changed, reset SMB connections first (prevents hanging)
-if ($routeChanged -and $lastRoute) {
-    Write-Log "Route changed - resetting SMB connections..."
+# Reset SMB if route changed, recovering from adapter-down, or 10GbE was down and came back
+# When a Thunderbolt dock is hot-reconnected to the same route, SMB sessions
+# from before the disconnect are stale and will hang unless cleared
+if (($routeChanged -and $lastRoute) -or $wasAdapterDown -or $10GbERecovered) {
+    $reason = if ($10GbERecovered) { "10GbE reconnection" } elseif ($wasAdapterDown) { "adapter recovery" } else { "route change" }
+    Write-Log "Resetting SMB connections (reason: $reason)..."
     Reset-SmbConnections
     Write-Log "SMB reset complete"
+
+    # Clear the adapter-down marker now that we've recovered
+    if ($wasAdapterDown) {
+        Remove-Item $AdapterDownMarker -Force -ErrorAction SilentlyContinue
+        Write-Log "Cleared adapter-down marker"
+    }
 }
 
 # Update hosts file
@@ -255,16 +330,22 @@ if ($ping) {
     Write-Log "Ping to $selectedIP - FAILED"
 }
 
-# Show toast notification if route changed
-if ($routeChanged) {
+# Show toast notification if route changed or recovered
+if ($needsSmbReset) {
     Write-Status ""
-    Write-Status "Route changed from '$lastRoute' to '$selectedRoute' - showing notification" "Yellow"
-    Write-Log "Showing toast notification..."
+    $notifyReason = if ($10GbERecovered -or ($wasAdapterDown -and -not $routeChanged)) { "reconnected" } else { "changed" }
+    Write-Status "Route $notifyReason - '$lastRoute' -> '$selectedRoute' - showing notification" "Yellow"
+    Write-Log "Showing toast notification (reason: $notifyReason)..."
 
     $icon = if ($selectedRoute -eq "10GbE Direct") { "⚡" } else { "🌐" }
     $speed = if ($selectedRoute -eq "10GbE Direct") { "10 Gbps" } elseif ($selectedRoute -eq "LAN (1GbE)") { "1 Gbps" } else { "WiFi" }
+    $toastMsg = if ($10GbERecovered -or ($wasAdapterDown -and -not $routeChanged)) {
+        "Gangal-NAS reconnected via $speed ($selectedIP)"
+    } else {
+        "Gangal-NAS now connected via $speed ($selectedIP)"
+    }
 
-    Show-ToastNotification "NAS Route: $selectedRoute" "Gangal-NAS now connected via $speed ($selectedIP)"
+    Show-ToastNotification "NAS Route: $selectedRoute" $toastMsg
     Write-Log "Toast notification triggered"
 }
 

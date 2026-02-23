@@ -18,6 +18,14 @@ if (-not $isAdmin) {
 
 Write-Host "=== Installing NAS Route Switcher Scheduled Task ===" -ForegroundColor Cyan
 Write-Host ""
+Write-Host "Script path: $ScriptPath" -ForegroundColor Gray
+
+# Verify script exists
+if (-not (Test-Path $ScriptPath)) {
+    Write-Host "ERROR: Script not found at $ScriptPath" -ForegroundColor Red
+    Stop-Transcript
+    exit 1
+}
 
 # Remove existing task if present
 $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -26,7 +34,7 @@ if ($existing) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
-# Create XML for the task (more reliable for event triggers)
+# Write task XML to temp file (schtasks /create /xml is more reliable than Register-ScheduledTask)
 $taskXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -57,7 +65,7 @@ $taskXml = @"
     </Principal>
   </Principals>
   <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <MultipleInstancesPolicy>Queue</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <AllowHardTerminate>true</AllowHardTerminate>
@@ -76,17 +84,70 @@ $taskXml = @"
   <Actions Context="Author">
     <Exec>
       <Command>powershell.exe</Command>
-      <Arguments>-ExecutionPolicy Bypass -WindowStyle Hidden -File "$ScriptPath" -Silent</Arguments>
+      <Arguments>-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$ScriptPath" -Silent</Arguments>
     </Exec>
   </Actions>
 </Task>
 "@
 
-try {
-    # Register task from XML
-    Register-ScheduledTask -TaskName $TaskName -Xml $taskXml -Force | Out-Null
+$xmlPath = Join-Path $env:TEMP "nas-route-switcher-task.xml"
 
-    Write-Host "Task '$TaskName' created successfully!" -ForegroundColor Green
+try {
+    # Write XML to temp file with UTF-16 encoding (required by schtasks)
+    $taskXml | Out-File -FilePath $xmlPath -Encoding Unicode -Force
+    Write-Host "Wrote task XML to $xmlPath" -ForegroundColor Gray
+
+    # Register using schtasks /create which handles SYSTEM principal reliably
+    $result = schtasks /create /tn $TaskName /xml $xmlPath /f 2>&1
+    Write-Host "schtasks output: $result" -ForegroundColor Gray
+
+    # Clean up temp file
+    Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
+
+    # Verify the task actually exists
+    $verify = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $verify) {
+        Write-Host "ERROR: Task registration reported success but task not found!" -ForegroundColor Red
+        Write-Host "Trying alternative registration..." -ForegroundColor Yellow
+
+        # Fallback: register without SYSTEM, run as current user with highest privileges
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`" -Silent"
+        $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances Queue
+
+        # Event triggers require CIM instances
+        $trigger1 = New-ScheduledTaskTrigger -AtLogOn
+
+        Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Settings $settings -Trigger $trigger1 -Force | Out-Null
+
+        # Add event triggers via CIM
+        $task = Get-ScheduledTask -TaskName $TaskName
+        $eventTriggerClass = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace Root/Microsoft/Windows/TaskScheduler
+
+        $eventIds = @(10000, 10001, 4004)
+        foreach ($eventId in $eventIds) {
+            $subscription = "<QueryList><Query Id='0' Path='Microsoft-Windows-NetworkProfile/Operational'><Select Path='Microsoft-Windows-NetworkProfile/Operational'>*[System[EventID=$eventId]]</Select></Query></QueryList>"
+            $trigger = New-CimInstance -CimClass $eventTriggerClass -ClientOnly -Property @{
+                Enabled = $true
+                Subscription = $subscription
+            }
+            $task.Triggers += $trigger
+        }
+        Set-ScheduledTask -InputObject $task | Out-Null
+
+        # Verify again
+        $verify = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if (-not $verify) {
+            Write-Host "ERROR: Fallback registration also failed!" -ForegroundColor Red
+            Stop-Transcript
+            exit 1
+        }
+        Write-Host "Fallback registration succeeded (running as $env:USERNAME instead of SYSTEM)" -ForegroundColor Green
+    }
+
+    Write-Host ""
+    Write-Host "Task '$TaskName' registered successfully!" -ForegroundColor Green
+    Write-Host "State: $($verify.State)" -ForegroundColor Green
     Write-Host ""
     Write-Host "Triggers:" -ForegroundColor Yellow
     Write-Host "  - Network connected (Event ID 10000)"
@@ -94,21 +155,28 @@ try {
     Write-Host "  - Network state change (Event ID 4004)"
     Write-Host "  - User logon"
     Write-Host ""
-    Write-Host "The task runs as SYSTEM with highest privileges." -ForegroundColor Gray
-    Write-Host ""
 
     # Run it now to set initial state
     Write-Host "Running task now to set initial state..." -ForegroundColor Yellow
     Start-ScheduledTask -TaskName $TaskName
-    Start-Sleep -Seconds 3
+    Start-Sleep -Seconds 20
 
-    # Verify it ran
-    $lastRun = (Get-ScheduledTaskInfo -TaskName $TaskName).LastRunTime
-    Write-Host "Last run: $lastRun" -ForegroundColor Gray
+    # Verify it ran by checking log
+    $info = Get-ScheduledTaskInfo -TaskName $TaskName
+    Write-Host "Last run: $($info.LastRunTime)" -ForegroundColor Gray
+    Write-Host "Last result: $($info.LastTaskResult)" -ForegroundColor Gray
+
+    $logPath = "C:\ProgramData\NASRouteSwitcher\route-switcher.log"
+    if (Test-Path $logPath) {
+        Write-Host ""
+        Write-Host "Recent log entries:" -ForegroundColor Yellow
+        Get-Content $logPath | Select-Object -Last 5
+    }
     Write-Host ""
     Write-Host "Done!" -ForegroundColor Green
 } catch {
     Write-Host "ERROR: Failed to create task: $_" -ForegroundColor Red
+    Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
     Stop-Transcript
     exit 1
 }
