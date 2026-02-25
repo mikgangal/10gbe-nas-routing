@@ -17,6 +17,14 @@ if (-not (Test-Path $DataDir)) {
     New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
 }
 
+# Log rotation: if log exceeds 100KB, rotate to .log.old
+if (Test-Path $LogFile) {
+    $logSize = (Get-Item $LogFile -ErrorAction SilentlyContinue).Length
+    if ($logSize -gt 102400) {
+        Move-Item -Path $LogFile -Destination "$LogFile.old" -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # Immediate log to confirm script started
 Add-Content -Path $LogFile -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Script starting..." -ErrorAction SilentlyContinue
 
@@ -30,28 +38,58 @@ function Write-Log($msg) {
     $logLine = "[$timestamp] $msg"
     Add-Content -Path $LogFile -Value $logLine -ErrorAction SilentlyContinue
 }
-$NasHostnames = @("gangal-nas", "gangal-nas.local")
-$Nas10GbeIP = "10.10.10.100"
-$Nas1GbeIP = "192.168.1.43"
 
-# Adapter names - adjust if yours differ
-$AdapterLAN = "Ethernet"          # Killer E3100G 2.5GbE
-$AdapterWiFi = "Wi-Fi"
+# Load configuration from config.json (next to this script), fall back to defaults
+$configPath = Join-Path $PSScriptRoot "config.json"
+$config = $null
+if (Test-Path $configPath) {
+    try {
+        $config = Get-Content $configPath -Raw | ConvertFrom-Json
+        Write-Log "Loaded config from $configPath"
+    } catch {
+        Write-Log "WARNING: Failed to parse config.json, using defaults: $_"
+    }
+}
+
+$NasHostnames      = if ($config.NasHostnames)      { @($config.NasHostnames) }    else { @("gangal-nas", "gangal-nas.local") }
+$Nas10GbeIP        = if ($config.Nas10GbeIP)         { $config.Nas10GbeIP }         else { "10.10.10.100" }
+$Nas1GbeIP         = if ($config.Nas1GbeIP)          { $config.Nas1GbeIP }          else { "192.168.1.43" }
+$Pc10GbeIP         = if ($config.Pc10GbeIP)          { $config.Pc10GbeIP }          else { "10.10.10.1" }
+$Pc10GbeSubnet     = if ($config.Pc10GbeSubnet)      { [int]$config.Pc10GbeSubnet } else { 24 }
+$Adapter10GbEMatch = if ($config.Adapter10GbEMatch)  { $config.Adapter10GbEMatch }  else { "10G|OWC" }
 
 function Write-Status($msg, $color = "White") {
     if (-not $Silent) { Write-Host $msg -ForegroundColor $color }
 }
 
-function Get-AdapterStatus($name) {
-    $adapter = Get-NetAdapter -Name $name -ErrorAction SilentlyContinue
-    return ($adapter -and $adapter.Status -eq "Up")
-}
-
 function Find-10GbEAdapter {
     # Find adapter by description (handles dynamic names for USB/Thunderbolt adapters)
+    # Match pattern is configurable via config.json (Adapter10GbEMatch)
     $adapter = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
-        $_.InterfaceDescription -match "10G|OWC" -and $_.Status -eq "Up"
+        $_.InterfaceDescription -match $Adapter10GbEMatch -and $_.Status -eq "Up"
     }
+    return $adapter
+}
+
+function Find-LANAdapter($exclude10GbE) {
+    # Find any UP physical (non-virtual) ethernet adapter that isn't the 10GbE
+    # Works regardless of adapter name — detects Realtek USB GbE, Killer E3100G, etc.
+    $adapter = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+        $_.Status -eq "Up" -and
+        $_.Virtual -eq $false -and
+        $_.ConnectorPresent -eq $true -and
+        $_.MediaType -eq "802.3" -and
+        (-not $exclude10GbE -or $_.InterfaceDescription -notmatch $Adapter10GbEMatch)
+    } | Sort-Object LinkSpeed -Descending | Select-Object -First 1
+    return $adapter
+}
+
+function Find-WiFiAdapter {
+    # Find any UP wireless adapter
+    $adapter = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+        $_.Status -eq "Up" -and
+        $_.MediaType -match "802\.11|Native"
+    } | Select-Object -First 1
     return $adapter
 }
 
@@ -94,7 +132,46 @@ function Reset-SmbConnections {
         $_.ClientComputerName -match "gangal-nas|$Nas10GbeIP|$Nas1GbeIP"
     } | Close-SmbSession -Force -ErrorAction SilentlyContinue
 
+    # Restart SMB client service to force-close persistent TCP connections
+    # net use /delete and Close-SmbSession don't kill connections held by open apps (File Explorer)
+    Write-Log "Restarting LanmanWorkstation service to force-close persistent connections..."
+    Restart-Service LanmanWorkstation -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+
     Write-Status "SMB connections reset" "Green"
+}
+
+function Set-NasRouteBlock($selectedRoute) {
+    # Block the NAS IP we DON'T want to use by adding a null route (IF 1 = loopback).
+    # This prevents Windows from reconnecting SMB via the wrong path.
+    # When on 10GbE: block 192.168.1.43 (force traffic to 10.10.10.100)
+    # When on LAN:   remove the block (allow 192.168.1.43), block 10.10.10.100 isn't needed since adapter is down
+    if ($selectedRoute -eq "10GbE Direct") {
+        # Block NAS 1GbE IP
+        route delete $Nas1GbeIP 2>$null | Out-Null
+        route add $Nas1GbeIP mask 255.255.255.255 0.0.0.0 IF 1 2>$null | Out-Null
+        Write-Log "Blocked route to $Nas1GbeIP (force 10GbE path)"
+    } else {
+        # Remove block on NAS 1GbE IP
+        route delete $Nas1GbeIP 2>$null | Out-Null
+        Write-Log "Unblocked route to $Nas1GbeIP (LAN/WiFi fallback)"
+    }
+}
+
+function Set-LANIPv6State($adapter, [bool]$enabled) {
+    # When 10GbE is active, disable IPv6 on the LAN adapter to prevent
+    # Windows SMB from using IPv6 link-local on the slower path.
+    # Re-enable when falling back to LAN.
+    if (-not $adapter) { return }
+    $binding = Get-NetAdapterBinding -Name $adapter.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+    if (-not $binding) { return }
+    if ($enabled -and -not $binding.Enabled) {
+        Enable-NetAdapterBinding -Name $adapter.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+        Write-Log "Re-enabled IPv6 on $($adapter.Name) (LAN fallback)"
+    } elseif (-not $enabled -and $binding.Enabled) {
+        Disable-NetAdapterBinding -Name $adapter.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+        Write-Log "Disabled IPv6 on $($adapter.Name) (10GbE active - prevent SMB wrong path)"
+    }
 }
 
 function Show-ToastNotification($title, $message) {
@@ -120,6 +197,44 @@ objShell.Popup "$message", 5, "$title", 64
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
     } catch {
         Write-Status "Toast notification failed: $_" "Yellow"
+    }
+}
+
+function Ensure-10GbEStaticIP($adapter) {
+    # Check if the 10GbE adapter has an IP on the correct subnet, auto-assign if not
+    $targetSubnet = ($Pc10GbeIP -replace "\.\d+$", ".")  # e.g. "10.10.10."
+    $currentIPs = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+
+    $hasCorrectIP = $false
+    foreach ($ip in $currentIPs) {
+        if ($ip.IPAddress.StartsWith($targetSubnet)) {
+            $hasCorrectIP = $true
+            Write-Log "10GbE adapter already has correct IP: $($ip.IPAddress)/$($ip.PrefixLength)"
+            break
+        }
+    }
+
+    if (-not $hasCorrectIP) {
+        $currentAddr = if ($currentIPs) { ($currentIPs | Select-Object -First 1).IPAddress } else { "none" }
+        Write-Log "10GbE adapter IP is '$currentAddr' - not on ${targetSubnet}x subnet, assigning ${Pc10GbeIP}/${Pc10GbeSubnet}"
+        Write-Status "Configuring 10GbE IP: $Pc10GbeIP/$Pc10GbeSubnet..." "Yellow"
+
+        # Remove existing IPv4 addresses on this adapter
+        $currentIPs | ForEach-Object {
+            Remove-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $_.IPAddress -Confirm:$false -ErrorAction SilentlyContinue
+        }
+
+        try {
+            New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $Pc10GbeIP -PrefixLength $Pc10GbeSubnet -ErrorAction Stop | Out-Null
+            Write-Log "Assigned static IP $Pc10GbeIP/$Pc10GbeSubnet to $($adapter.Name)"
+            Write-Status "10GbE IP configured: $Pc10GbeIP" "Green"
+
+            # Brief wait for IP to take effect
+            Start-Sleep -Seconds 2
+        } catch {
+            Write-Log "ERROR: Failed to assign static IP: $_"
+            Write-Status "ERROR: Failed to configure 10GbE IP: $_" "Red"
+        }
     }
 }
 
@@ -174,8 +289,10 @@ Write-Status ""
 Write-Log "Checking network adapters..."
 $adapter10GbE = Find-10GbEAdapter
 $has10GbE = $null -ne $adapter10GbE
-$hasLAN = Get-AdapterStatus $AdapterLAN
-$hasWiFi = Get-AdapterStatus $AdapterWiFi
+$adapterLANFound = Find-LANAdapter -exclude10GbE $true
+$hasLAN = $null -ne $adapterLANFound
+$adapterWiFiFound = Find-WiFiAdapter
+$hasWiFi = $null -ne $adapterWiFiFound
 
 # Debounce: if 10GbE is down but was our last route, retry up to 3 times
 # This prevents premature fallback during Thunderbolt re-enumeration
@@ -198,17 +315,26 @@ if (-not $has10GbE -and $lastRoute -eq "10GbE Direct") {
             break
         }
     }
+    # Re-check LAN/WiFi after debounce period (they may have come up)
+    if (-not $has10GbE) {
+        $adapterLANFound = Find-LANAdapter -exclude10GbE $true
+        $hasLAN = $null -ne $adapterLANFound
+        $adapterWiFiFound = Find-WiFiAdapter
+        $hasWiFi = $null -ne $adapterWiFiFound
+    }
 }
 
 $10GbEName = if ($has10GbE) { $adapter10GbE.Name } else { "not connected" }
+$lanName = if ($hasLAN) { "$($adapterLANFound.Name) ($($adapterLANFound.InterfaceDescription))" } else { "none found" }
+$wifiName = if ($hasWiFi) { "$($adapterWiFiFound.Name)" } else { "none found" }
 Write-Log "10GbE ($10GbEName): $(if($has10GbE){'UP'}else{'DOWN'})"
-Write-Log "LAN ($AdapterLAN): $(if($hasLAN){'UP'}else{'DOWN'})"
-Write-Log "WiFi ($AdapterWiFi): $(if($hasWiFi){'UP'}else{'DOWN'})"
+Write-Log "LAN ($lanName): $(if($hasLAN){'UP'}else{'DOWN'})"
+Write-Log "WiFi ($wifiName): $(if($hasWiFi){'UP'}else{'DOWN'})"
 
 Write-Status "Network Status:" "Yellow"
 Write-Status "  10GbE ($10GbEName): $(if($has10GbE){'UP'}else{'DOWN'})" $(if($has10GbE){"Green"}else{"Gray"})
-Write-Status "  LAN ($AdapterLAN): $(if($hasLAN){'UP'}else{'DOWN'})" $(if($hasLAN){"Green"}else{"Gray"})
-Write-Status "  WiFi ($AdapterWiFi): $(if($hasWiFi){'UP'}else{'DOWN'})" $(if($hasWiFi){"Green"}else{"Gray"})
+Write-Status "  LAN ($lanName): $(if($hasLAN){'UP'}else{'DOWN'})" $(if($hasLAN){"Green"}else{"Gray"})
+Write-Status "  WiFi ($wifiName): $(if($hasWiFi){'UP'}else{'DOWN'})" $(if($hasWiFi){"Green"}else{"Gray"})
 Write-Status ""
 
 # Determine best route
@@ -234,8 +360,10 @@ if ($has10GbE) {
         $elapsed += $pollInterval
         $adapter10GbE = Find-10GbEAdapter
         $has10GbE = $null -ne $adapter10GbE
-        $hasLAN = Get-AdapterStatus $AdapterLAN
-        $hasWiFi = Get-AdapterStatus $AdapterWiFi
+        $adapterLANFound = Find-LANAdapter -exclude10GbE $true
+        $hasLAN = $null -ne $adapterLANFound
+        $adapterWiFiFound = Find-WiFiAdapter
+        $hasWiFi = $null -ne $adapterWiFiFound
         if ($has10GbE -or $hasLAN -or $hasWiFi) {
             Write-Log "Adapter recovered after ${elapsed}s - 10GbE:$(if($has10GbE){'UP'}else{'DOWN'}) LAN:$(if($hasLAN){'UP'}else{'DOWN'}) WiFi:$(if($hasWiFi){'UP'}else{'DOWN'})"
             break
@@ -278,6 +406,16 @@ $wasAdapterDown = Test-Path $AdapterDownMarker
 $needsSmbReset = $routeChanged -or $wasAdapterDown -or $10GbERecovered
 Write-Log "Last route: '$lastRoute' | New route: '$selectedRoute' | Changed: $routeChanged | Recovering from down: $wasAdapterDown | 10GbE recovered: $10GbERecovered"
 
+# Manage network path isolation to prevent SMB using wrong adapter
+# When 10GbE is active: disable IPv6 on LAN + block NAS 1GbE IP (force all traffic via 10GbE)
+# When falling back to LAN: re-enable IPv6 + unblock NAS 1GbE IP
+if ($selectedRoute -eq "10GbE Direct") {
+    Set-LANIPv6State $adapterLANFound $false
+} else {
+    Set-LANIPv6State $adapterLANFound $true
+}
+Set-NasRouteBlock $selectedRoute
+
 # Reset SMB if route changed, recovering from adapter-down, or 10GbE was down and came back
 # When a Thunderbolt dock is hot-reconnected to the same route, SMB sessions
 # from before the disconnect are stale and will hang unless cleared
@@ -292,6 +430,11 @@ if (($routeChanged -and $lastRoute) -or $wasAdapterDown -or $10GbERecovered) {
         Remove-Item $AdapterDownMarker -Force -ErrorAction SilentlyContinue
         Write-Log "Cleared adapter-down marker"
     }
+}
+
+# Auto-configure 10GbE static IP if needed
+if ($selectedRoute -eq "10GbE Direct" -and $adapter10GbE) {
+    Ensure-10GbEStaticIP $adapter10GbE
 }
 
 # Update hosts file
@@ -326,8 +469,39 @@ if ($ping) {
     Write-Status "NAS is reachable at $selectedIP" "Green"
     Write-Log "Ping to $selectedIP - SUCCESS"
 } else {
-    Write-Status "WARNING: NAS not responding at $selectedIP" "Red"
-    Write-Log "Ping to $selectedIP - FAILED"
+    Write-Log "Ping to $selectedIP - FAILED, diagnosing..."
+
+    # Diagnose: check if the adapter has the right IP
+    if ($selectedRoute -eq "10GbE Direct" -and $adapter10GbE) {
+        $adapterIPs = Get-NetIPAddress -InterfaceIndex $adapter10GbE.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        $ipList = ($adapterIPs | ForEach-Object { $_.IPAddress }) -join ", "
+        Write-Log "10GbE adapter IPs: $ipList"
+
+        $targetSubnet = ($Pc10GbeIP -replace "\.\d+$", ".")
+        $onCorrectSubnet = $adapterIPs | Where-Object { $_.IPAddress.StartsWith($targetSubnet) }
+
+        if (-not $onCorrectSubnet) {
+            Write-Log "10GbE adapter not on ${targetSubnet}x subnet - attempting IP fix..."
+            Write-Status "10GbE IP misconfigured, attempting fix..." "Yellow"
+            Ensure-10GbEStaticIP $adapter10GbE
+
+            # Retry ping after fix
+            $ping2 = Test-Connection -ComputerName $selectedIP -Count 2 -ErrorAction SilentlyContinue
+            if ($ping2) {
+                Write-Status "NAS is reachable at $selectedIP (after IP fix)" "Green"
+                Write-Log "Ping to $selectedIP after IP fix - SUCCESS"
+            } else {
+                Write-Status "WARNING: NAS still not responding at $selectedIP after IP fix" "Red"
+                Write-Log "Ping to $selectedIP after IP fix - STILL FAILED"
+            }
+        } else {
+            Write-Status "WARNING: NAS not responding at $selectedIP (IP config looks correct: $ipList)" "Red"
+            Write-Log "IP config looks correct ($ipList) but NAS not responding - may be a NAS-side issue"
+        }
+    } else {
+        Write-Status "WARNING: NAS not responding at $selectedIP" "Red"
+        Write-Log "Ping to $selectedIP - FAILED (non-10GbE route, no auto-fix available)"
+    }
 }
 
 # Show toast notification if route changed or recovered

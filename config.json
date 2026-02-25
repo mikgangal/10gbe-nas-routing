@@ -1,0 +1,8 @@
+{
+  "NasHostnames": ["gangal-nas", "gangal-nas.local"],
+  "Nas10GbeIP": "10.10.10.100",
+  "Nas1GbeIP": "192.168.1.43",
+  "Pc10GbeIP": "10.10.10.1",
+  "Pc10GbeSubnet": 24,
+  "Adapter10GbEMatch": "10G|OWC"
+}
